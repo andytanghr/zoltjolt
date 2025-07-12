@@ -59,7 +59,10 @@ def process_youtube_url(url: str):
         print(f"  > Title: {yt.title}")
         
         # 1. Attempt to get English captions
-        caption = yt.captions.get_by_language_code('en')
+        caption_en = yt.captions.get_by_language_code('en')
+        caption_a_en = yt.captions.get_by_language_code('a.en')
+        if caption_en is None and caption_a_en:
+            caption = caption_a_en
         
         if caption:
             print("  > Found English captions. Processing...")
