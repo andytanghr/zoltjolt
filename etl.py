@@ -54,52 +54,47 @@ def parse_srt_segment(segment: str):
 def process_youtube_url(url: str):
     """
     Main processing function for a single YouTube URL with detailed logging.
-    Raises exceptions on failure.
+    This version uses a stable get-or-create pattern for video records.
     """
     print(f"\nProcessing URL: {url}")
     yt = YouTube(url)
     print(f"  > Title: {yt.title}")
 
+    # --- Step 1: Get a stable ID for the video ---
+    # This creates the video record first to get a stable ID, preventing duplicates.
+    video_id = db.get_or_create_video(url, yt.title, None)
+    print(f"  > Database Video ID: {video_id} (This is stable)")
+
     # LOGGING: Check all available caption codes
     all_caption_codes = [c.code for c in yt.captions]
     print(f"  > Available caption codes: {all_caption_codes if all_caption_codes else 'None'}")
 
-    # 1. Attempt to get English captions
-    caption_en = yt.captions.get_by_language_code('en')
-    caption_a_en = yt.captions.get_by_language_code('a.en') # auto-generated
+    # --- Step 2: Attempt to get English captions ---
+    caption_en = yt.captions.get('en')
+    caption_a_en = yt.captions.get('a.en') # auto-generated
+    caption = caption_en or caption_a_en
     
-    caption = None
-    if caption_en:
-        caption = caption_en
-        print("  > Found manually-created English captions ('en').")
-    elif caption_a_en:
-        caption = caption_a_en
-        print("  > Found auto-generated English captions ('a.en').")
-
     if caption:
-        print("  > Proceeding with caption processing...")
-        video_stream = yt.streams.get_highest_resolution()
-        video_path = video_stream.download(output_path=str(DOWNLOAD_DIR))
-        print(f"  > Video downloaded to: {video_path}")
-
-        video_id = db.add_video(url, yt.title, video_path)
-
+        print(f"  > Found English captions ('{caption.code}'). Proceeding with full processing...")
         try:
+            # Download video and update the database record with its path
+            video_stream = yt.streams.get_highest_resolution()
+            video_path = video_stream.download(output_path=str(DOWNLOAD_DIR))
+            db.update_video_path(video_id, video_path) # Update path on existing record
+            print(f"  > Video downloaded to: {video_path}")
+
+            # Generate and process SRT captions
             srt_captions = caption.generate_srt_captions()
-            # LOGGING: Confirm that SRT generation worked
             if not srt_captions:
-                message = "Caption track was found, but failed to generate SRT content. No transcript available."
+                message = "Caption track was found, but failed to generate SRT content."
                 print(f"  [ERROR] {message}")
                 db.update_queue_status(url, 'failed', message)
                 return
-            
+
             print(f"  > Successfully generated SRT data ({len(srt_captions)} bytes).")
             
             srt_segments = srt_captions.strip().split('\n\n')
-            print(f"  > Split SRT data into {len(srt_segments)} potential segments.")
-
-            successful_segments = 0
-            failed_segments = 0
+            successful_segments, failed_segments = 0, 0
             for segment_str in srt_segments:
                 segment = parse_srt_segment(segment_str)
                 if segment:
@@ -108,35 +103,39 @@ def process_youtube_url(url: str):
                         video_id, segment['start'], segment['end'], segment['text'], sentiment
                     )
                     successful_segments += 1
-                else:
-                    if segment_str.strip(): # Don't count empty lines as failures
-                        failed_segments += 1
+                elif segment_str.strip(): # Don't count empty lines as failures
+                    failed_segments += 1
             
-            # LOGGING: Final summary of parsing
-            print(f"  > Summary: {successful_segments} segments parsed successfully, {failed_segments} failed parsing.")
-
+            print(f"  > Summary: {successful_segments} segments parsed, {failed_segments} failed.")
             if successful_segments > 0:
                 message = f'Successfully processed with {successful_segments} caption segments.'
                 db.update_queue_status(url, 'completed', message)
             else:
-                message = f'Processed, but failed to parse any of the {len(srt_segments)} caption segments. Check logs for parsing errors.'
+                message = 'Processed, but failed to parse any caption segments.'
                 db.update_queue_status(url, 'failed', message)
 
         except Exception as e:
-            message = f"An error occurred during caption generation/processing: {e}"
+            message = f"An error occurred during video download or caption processing: {e}"
             print(f"  [ERROR] {message}")
             db.update_queue_status(url, 'failed', message)
 
     else:
-        # LOGGING: This is the "no captions found" path
-        message = "No English captions ('en' or 'a.en') found. Downloading audio only for potential future processing."
+        # Path for when no English captions are found
+        message = "No English captions found. Downloading audio only for reference."
         print(f"  > {message}")
-        audio_stream = yt.streams.get_audio_only()
-        audio_path = audio_stream.download(output_path=str(DOWNLOAD_DIR))
-        print(f"  > Audio downloaded to: {audio_path}")
-        
-        db.add_video(url, yt.title, download_path=None)
-        db.update_queue_status(url, 'completed', message) # Completed, but with a note.
+        try:
+            audio_stream = yt.streams.get_audio_only()
+            audio_path = audio_stream.download(output_path=str(DOWNLOAD_DIR))
+            # Correctly associate the downloaded audio file with the video record
+            db.add_audio(video_id, audio_path)
+            print(f"  > Audio downloaded to: {audio_path} and linked to video ID {video_id}.")
+            
+            # Mark as 'completed' but with a message indicating no captions were processed.
+            db.update_queue_status(url, 'completed', message)
+        except Exception as e:
+            message = f"An error occurred during audio download: {e}"
+            print(f"  [ERROR] {message}")
+            db.update_queue_status(url, 'failed', message)
 
 # --- Script Entry Point ---
 def main():

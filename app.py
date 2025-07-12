@@ -1,8 +1,10 @@
-# app.py
+# content of: app.py
 import streamlit as st
 import pandas as pd
 import database_manager as db
 import time
+from pathlib import Path
+import sqlite3
 
 def format_seconds_to_srt(seconds: float) -> str:
     """Converts a float number of seconds to HH:MM:SS,ms format."""
@@ -36,6 +38,8 @@ def render_general_analysis(caption_df: pd.DataFrame):
         st.bar_chart(sentiment_dist_df)
 
 def main():
+    db.requeue_stale_jobs()
+    
     """The main Streamlit application function."""
     st.set_page_config(page_title="YouTube Content Analyzer", layout="wide")
     st.title("🎬 YouTube Content Analyzer")
@@ -99,7 +103,6 @@ def main():
     completed_df = all_videos_df[all_videos_df['status'] == 'completed'].copy()
 
     if not completed_df.empty:
-        # Use a copy to avoid SettingWithCopyWarning
         completed_df['display_title'] = completed_df['title'].fillna('Title not available')
         selected_title = st.selectbox(
             "Select a video to see its detailed analysis:",
@@ -109,6 +112,31 @@ def main():
         if selected_title:
             selected_video = completed_df[completed_df['display_title'] == selected_title].iloc[0]
             video_id = selected_video['video_id']
+            
+            # --- NEW: DELETE BUTTON LOGIC ---
+            with st.expander("🗑️ Danger Zone: Delete This Video"):
+                st.warning(f"This will permanently delete the video '{selected_title}', its downloaded files, and all associated database records. This action cannot be undone.")
+                
+                if st.button("Confirm Permanent Deletion", key=f"delete_{video_id}"):
+                    try:
+                        paths_to_delete = db.delete_video_and_references(video_id)
+                        
+                        deleted_files_count = 0
+                        for file_path in paths_to_delete:
+                            if file_path and file_path.exists():
+                                file_path.unlink()
+                                deleted_files_count += 1
+                        
+                        st.success(f"Successfully deleted '{selected_title}' and {deleted_files_count} associated file(s). Refreshing...")
+                        time.sleep(2)
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"An error occurred during deletion: {e}")
+            
+            st.markdown("---")
+            # --- END OF NEW LOGIC ---
+
             captions = db.get_captions_for_video(video_id)
 
             if captions:
@@ -116,7 +144,7 @@ def main():
                 render_general_analysis(caption_df)
 
                 st.subheader("Timestamped Transcript")
-                with st.container(height=400): # Makes the list scrollable
+                with st.container(height=400):
                     for _, row in caption_df.iterrows():
                         start_time = format_seconds_to_srt(row['start_time'])
                         color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
@@ -127,7 +155,6 @@ def main():
         st.info("No videos have been successfully completed yet.")
 
 
-    # --- COLLAPSIBLE SECTION FOR ALL VIDEOS ---
     with st.expander("Show All Submitted Videos & Full Status History"):
         st.dataframe(
             all_videos_df[['youtube_url', 'status', 'title', 'status_message', 'updated_at']],
@@ -139,14 +166,10 @@ def main():
             }
         )
 
- # --- NEW: DATABASE INSPECTOR SECTION ---
     st.markdown("---")
     with st.expander("🗃️ Database Inspector (Advanced View)"):
         st.info("This section shows the raw data from the project's database tables.")
-
-        # List of all tables we want to display
         table_names = ["processing_queue", "videos", "captions", "audios"]
-
         for table in table_names:
             st.subheader(f"Table: `{table}`")
             try:
@@ -161,5 +184,5 @@ def main():
             st.markdown("---")
 
 if __name__ == "__main__":
-    db.setup_database() # Ensure the DB is set up when the app starts
+    db.setup_database()
     main()

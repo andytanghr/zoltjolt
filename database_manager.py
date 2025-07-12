@@ -1,4 +1,4 @@
-# database_manager.py
+# content of: database_manager.py
 import sqlite3
 from pathlib import Path
 import datetime
@@ -17,6 +17,9 @@ def setup_database():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
     cursor = conn.cursor()
 
+    # Enable foreign key support
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
     # Videos table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS videos (
@@ -33,7 +36,7 @@ def setup_database():
         id INTEGER PRIMARY KEY,
         video_id INTEGER NOT NULL,
         audio_path TEXT NOT NULL,
-        FOREIGN KEY (video_id) REFERENCES videos (id)
+        FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
     );
     """)
     # Captions table
@@ -46,7 +49,7 @@ def setup_database():
         text TEXT NOT NULL,
         sentiment_label TEXT,
         sentiment_score REAL,
-        FOREIGN KEY (video_id) REFERENCES videos (id)
+        FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
     );
     """)
     # Processing Queue table
@@ -113,17 +116,36 @@ def update_queue_status(url: str, status: str, message: str = None):
     conn.close()
 
 # --- Write Functions (for etl.py) ---
-def add_video(url, title, download_path):
-    """Adds a video record and returns its new ID."""
+def get_or_create_video(url, title, download_path):
+    """
+    Gets the ID of an existing video or creates a new one if not found.
+    Returns the stable video ID. This is non-destructive.
+    """
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO videos (youtube_url, title, download_path) VALUES (?, ?, ?)",
-                   (url, title, download_path))
+    # Check if the video already exists
     cursor.execute("SELECT id FROM videos WHERE youtube_url = ?", (url,))
-    video_id = cursor.fetchone()[0]
+    video_row = cursor.fetchone()
+
+    if video_row:
+        video_id = video_row[0]
+    else:
+        # Insert a new video record and get its ID
+        cursor.execute("INSERT INTO videos (youtube_url, title, download_path) VALUES (?, ?, ?)",
+                       (url, title, download_path)) 
+        video_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
     return video_id
+
+def update_video_path(video_id, download_path):
+    """Updates the download_path for a given video."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE videos SET download_path = ? WHERE id = ?", (download_path, video_id))
+    conn.commit()
+    conn.close()
 
 def add_audio(video_id, audio_path):
     """Adds an audio record."""
@@ -145,7 +167,50 @@ def add_caption_segment(video_id, start, end, text, sentiment):
     conn.commit()
     conn.close()
 
-# --- NEW: Raw Table Read Functions (for app.py inspector) ---
+# --- NEW: Deletion Function ---
+def delete_video_and_references(video_id: int):
+    """
+    Deletes a video and all its associated data from the database,
+    and returns the local file paths of the video/audio for filesystem deletion.
+    """
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    paths_to_delete = []
+
+    # Step 1: Gather file paths and youtube_url before deleting
+    cursor.execute("SELECT download_path, youtube_url FROM videos WHERE id = ?", (video_id,))
+    video_info = cursor.fetchone()
+    if not video_info:
+        conn.close()
+        return []
+
+    video_path, youtube_url = video_info
+    if video_path:
+        paths_to_delete.append(Path(video_path))
+
+    cursor.execute("SELECT audio_path FROM audios WHERE video_id = ?", (video_id,))
+    audio_rows = cursor.fetchall()
+    for row in audio_rows:
+        if row[0]:
+            paths_to_delete.append(Path(row[0]))
+
+    # Step 2: Delete database records
+    # With "ON DELETE CASCADE" enabled, we only need to delete the video record.
+    # The related captions and audios will be deleted automatically.
+    cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+    
+    # Also remove it from the queue
+    if youtube_url:
+        cursor.execute("DELETE FROM processing_queue WHERE youtube_url = ?", (youtube_url,))
+
+    conn.commit()
+    conn.close()
+    
+    return paths_to_delete
+
+# --- Raw Table Read Functions (for app.py inspector) ---
 def get_all_from_table(table_name: str):
     """A generic function to fetch all rows from a given table."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
@@ -187,3 +252,15 @@ def get_captions_for_video(video_id):
     captions = cursor.execute("SELECT start_time, end_time, text, sentiment_label, sentiment_score FROM captions WHERE video_id = ? ORDER BY start_time ASC;", (video_id,)).fetchall()
     conn.close()
     return captions
+
+def requeue_stale_jobs(timeout_minutes=60):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE processing_queue
+        SET status = 'queued', status_message = 'Re-queued after timeout'
+        WHERE status = 'processing'
+          AND (strftime('%s', 'now') - strftime('%s', updated_at)) > ?
+    """, (timeout_minutes * 60,))
+    conn.commit()
+    conn.close()
