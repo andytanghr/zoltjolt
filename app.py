@@ -2,21 +2,19 @@
 import streamlit as st
 import pandas as pd
 import database_manager as db
-import subprocess # To run the ETL script in the background
-import sys # To find the python executable
-import time # To add a small delay for user experience
+import time
 
 def format_seconds_to_srt(seconds: float) -> str:
     """Converts a float number of seconds to HH:MM:SS,ms format."""
+    if seconds is None: return "00:00:00,000"
     millis = int((seconds - int(seconds)) * 1000)
-    # timedelta handles the conversion to HH:MM:SS
     td = pd.to_timedelta(seconds, unit='s')
     return f"{str(td).split('.')[0]},{millis:03d}"
 
 def render_general_analysis(caption_df: pd.DataFrame):
     """Renders general and sectional sentiment analysis."""
     st.subheader("Overall Sentiment Analysis")
-    
+
     if caption_df.empty:
         st.warning("No caption data available for analysis.")
         return
@@ -25,7 +23,7 @@ def render_general_analysis(caption_df: pd.DataFrame):
     positive_count = len(caption_df[caption_df['sentiment_label'] == 'POSITIVE'])
     negative_count = len(caption_df[caption_df['sentiment_label'] == 'NEGATIVE'])
     neutral_count = len(caption_df[caption_df['sentiment_label'] == 'NEUTRAL'])
-    
+
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Average Sentiment Score", f"{average_score:.2f}")
@@ -40,76 +38,107 @@ def render_general_analysis(caption_df: pd.DataFrame):
 def main():
     """The main Streamlit application function."""
     st.set_page_config(page_title="YouTube Content Analyzer", layout="wide")
-    st.title("YouTube Content Analyzer")
+    st.title("🎬 YouTube Content Analyzer")
     st.markdown("---")
 
-    # --- UI TO START THE ETL PROCESS ---
-    st.header("1. Add a New Video")
-    st.info("Enter a YouTube URL below and click 'Start Analysis'. The process will run in the background.", icon="▶️")
-    
-    url_input = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
-    
-    if st.button("Start Analysis", key="start_button"):
+    # --- INSTRUCTIONS AND ETL MANAGEMENT ---
+    st.header("1. Add New Videos to the Queue")
+    st.info(
+        "**How to use:**\n"
+        "1. In a separate terminal, run the command: `python etl.py` to start the background worker.\n"
+        "2. Paste one or more YouTube URLs (one per line) into the text area below.\n"
+        "3. Click 'Add to Queue'. The worker will automatically pick them up."
+    )
+
+    url_input = st.text_area(
+        "YouTube URLs (one per line)",
+        placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...",
+        height=150
+    )
+
+    if st.button("Add to Queue", key="add_button"):
         if url_input:
-            with st.spinner("Starting the ETL process... This may take a few minutes."):
-                # We run etl.py as a separate, non-blocking process
-                # This prevents the Streamlit UI from freezing
-                python_executable = sys.executable
-                process = subprocess.Popen([python_executable, "etl.py", url_input])
-                
-                # Optional: wait for the process to finish to give a success message
-                # In a real heavy-duty app, you might use a more advanced queue system
-                process.wait()
-
-            st.success(f"Processing complete for {url_input}! The results below have been updated.")
-            # Add a small delay then rerun the page to refresh the data display
-            time.sleep(2)
-            st.rerun()
+            urls = [url.strip() for url in url_input.split('\n') if url.strip()]
+            if urls:
+                db.add_urls_to_queue(urls)
+                st.success(f"Successfully added {len(urls)} URL(s) to the processing queue.")
+                time.sleep(1) # Small delay for better UX
+                st.rerun()
+            else:
+                st.warning("Please enter at least one valid URL.")
         else:
-            st.warning("Please enter a URL.")
-            
+            st.warning("The text area is empty.")
+
     st.markdown("---")
 
-    # --- UI TO DISPLAY RESULTS ---
-    st.header("2. Explore Processed Videos")
-    
-    all_videos = db.get_all_processed_videos()
-    
-    if not all_videos:
-        st.warning("No videos have been processed yet. Use the tool above to start.")
+    # --- UI TO DISPLAY RESULTS AND STATUS ---
+    st.header("2. Processing Status & Results")
+
+    # Fetch all data once
+    all_videos_data = db.get_all_videos_with_status()
+    if not all_videos_data:
+        st.info("No videos have been submitted yet. Use the tool above to start.")
         return
 
-    all_videos_as_dicts = [dict(row) for row in all_videos]
-    video_df = pd.DataFrame(all_videos_as_dicts)
+    all_videos_df = pd.DataFrame([dict(row) for row in all_videos_data])
 
-    # Allow user to select a video to see its details
-    selected_title = st.selectbox(
-        "Select a video to see its detailed analysis:",
-        options=video_df['title']
-    )
-    
-    if selected_title:
-        video_id = int(video_df[video_df['title'] == selected_title]['id'].iloc[0])
-        captions = db.get_captions_for_video(video_id)
-        
-        if captions:
-            captions_as_dicts = [dict(row) for row in captions]
-            caption_df = pd.DataFrame(captions_as_dicts)
-            
-            # --- RENDER ANALYSIS ---
-            render_general_analysis(caption_df)
+    # Display the current queue
+    st.subheader("Current Queue")
+    queue_df = all_videos_df[all_videos_df['status'].isin(['queued', 'processing'])]
+    if not queue_df.empty:
+        st.dataframe(
+            queue_df[['youtube_url', 'status']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("The processing queue is currently empty.")
 
-            # --- RENDER TIMESTAMPED CAPTIONS (NEW) ---
-            st.subheader("Timestamped Transcript")
-            with st.container(height=300): # Makes the list scrollable
-                for index, row in caption_df.iterrows():
-                    start_time = format_seconds_to_srt(row['start_time'])
-                    # Simple color coding for sentiment
-                    color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
-                    st.markdown(f"**`{start_time}`** : {row['text']} [:{color}[{row['sentiment_label']}]]")
+    # Display selection for completed videos
+    st.subheader("Explore Completed Videos")
+    completed_df = all_videos_df[all_videos_df['status'] == 'completed'].copy()
 
-        else:
-            st.info("This video was processed but had no English captions, so only an audio file was downloaded.")
+    if not completed_df.empty:
+        # Use a copy to avoid SettingWithCopyWarning
+        completed_df['display_title'] = completed_df['title'].fillna('Title not available')
+        selected_title = st.selectbox(
+            "Select a video to see its detailed analysis:",
+            options=completed_df['display_title']
+        )
+
+        if selected_title:
+            selected_video = completed_df[completed_df['display_title'] == selected_title].iloc[0]
+            video_id = selected_video['video_id']
+            captions = db.get_captions_for_video(video_id)
+
+            if captions:
+                caption_df = pd.DataFrame([dict(row) for row in captions])
+                render_general_analysis(caption_df)
+
+                st.subheader("Timestamped Transcript")
+                with st.container(height=400): # Makes the list scrollable
+                    for _, row in caption_df.iterrows():
+                        start_time = format_seconds_to_srt(row['start_time'])
+                        color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
+                        st.markdown(f"**`{start_time}`** : {row['text']} [:{color}[{row['sentiment_label']}]]")
+            else:
+                st.info("This video was processed, but no English captions were found. Only the audio file was saved.")
+    else:
+        st.info("No videos have been successfully completed yet.")
+
+
+    # --- COLLAPSIBLE SECTION FOR ALL VIDEOS ---
+    with st.expander("Show All Submitted Videos & Full Status History"):
+        st.dataframe(
+            all_videos_df[['youtube_url', 'status', 'title', 'status_message', 'updated_at']],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "youtube_url": st.column_config.LinkColumn("YouTube URL", display_text="🔗 Link"),
+                "updated_at": st.column_config.DatetimeColumn("Last Updated", format="YYYY-MM-DD HH:mm:ss")
+            }
+        )
+
 
 if __name__ == "__main__":
     db.setup_database() # Ensure the DB is set up when the app starts
