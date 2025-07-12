@@ -139,6 +139,26 @@ def main():
             }
         )
 
+ # --- NEW: DATABASE INSPECTOR SECTION ---
+    st.markdown("---")
+    with st.expander("🗃️ Database Inspector (Advanced View)"):
+        st.info("This section shows the raw data from the project's database tables.")
+
+        # List of all tables we want to display
+        table_names = ["processing_queue", "videos", "captions", "audios"]
+
+        for table in table_names:
+            st.subheader(f"Table: `{table}`")
+            try:
+                table_data = db.get_all_from_table(table)
+                if table_data:
+                    df = pd.DataFrame([dict(row) for row in table_data])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.write("This table is currently empty.")
+            except sqlite3.OperationalError as e:
+                st.error(f"Could not read table '{table}'. It might not exist yet. Error: {e}")
+            st.markdown("---")
 
 if __name__ == "__main__":
     db.setup_database() # Ensure the DB is set up when the app starts
