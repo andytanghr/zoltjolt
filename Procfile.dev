@@ -1,0 +1,2 @@
+web: streamlit run app.py
+worker: watchmedo auto-restart --directory=. --pattern="*.py" --recursive -- python etl.py
