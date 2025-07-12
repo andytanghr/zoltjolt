@@ -1,4 +1,4 @@
-# etl.py
+# content of: etl.py
 import time
 from pathlib import Path
 
@@ -13,6 +13,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 WORKER_SLEEP_INTERVAL = 10 # Seconds to wait when queue is empty
 
 # --- Function Stubs ---
+# (analyze_sentiment and parse_srt_segment remain the same)
 def analyze_sentiment(text: str) -> dict:
     """STUB: Analyzes the sentiment of a text string."""
     if "happy" in text.lower() or "love" in text.lower():
@@ -21,7 +22,6 @@ def analyze_sentiment(text: str) -> dict:
         return {"label": "NEGATIVE", "score": -0.8}
     return {"label": "NEUTRAL", "score": 0.1}
 
-# --- Core Logic Functions ---
 def parse_srt_segment(segment: str):
     """Parses a single SRT block into its components."""
     lines = segment.strip().split('\n')
@@ -51,7 +51,9 @@ def parse_srt_segment(segment: str):
         print(f"  [WARN] Could not parse timestamp line: '{time_line}'. Error: {e}")
         return None
 
-def process_youtube_url(url: str):
+# --- Core Logic Functions ---
+# --- MODIFIED: Function now accepts the skip_download flag ---
+def process_youtube_url(url: str, skip_download: bool):
     """
     Main processing function for a single YouTube URL with detailed logging.
     This version uses a stable get-or-create pattern for video records.
@@ -59,31 +61,34 @@ def process_youtube_url(url: str):
     print(f"\nProcessing URL: {url}")
     yt = YouTube(url)
     print(f"  > Title: {yt.title}")
+    
+    # --- MODIFIED: Log the download flag status ---
+    if skip_download:
+        print("  > Flag set to SKIP video download.")
 
-    # --- Step 1: Get a stable ID for the video ---
-    # This creates the video record first to get a stable ID, preventing duplicates.
     video_id = db.get_or_create_video(url, yt.title, None)
     print(f"  > Database Video ID: {video_id} (This is stable)")
 
-    # LOGGING: Check all available caption codes
     all_caption_codes = [c.code for c in yt.captions]
     print(f"  > Available caption codes: {all_caption_codes if all_caption_codes else 'None'}")
 
-    # --- Step 2: Attempt to get English captions ---
     caption_en = yt.captions.get('en')
-    caption_a_en = yt.captions.get('a.en') # auto-generated
+    caption_a_en = yt.captions.get('a.en')
     caption = caption_en or caption_a_en
     
     if caption:
         print(f"  > Found English captions ('{caption.code}'). Proceeding with full processing...")
         try:
-            # Download video and update the database record with its path
-            video_stream = yt.streams.get_highest_resolution()
-            video_path = video_stream.download(output_path=str(DOWNLOAD_DIR))
-            db.update_video_path(video_id, video_path) # Update path on existing record
-            print(f"  > Video downloaded to: {video_path}")
+            # --- MODIFIED: Conditional video download ---
+            if not skip_download:
+                print("  > Downloading video file...")
+                video_stream = yt.streams.get_highest_resolution()
+                video_path = video_stream.download(output_path=str(DOWNLOAD_DIR))
+                db.update_video_path(video_id, video_path)
+                print(f"  > Video downloaded to: {video_path}")
+            else:
+                print("  > Skipping video download as requested.")
 
-            # Generate and process SRT captions
             srt_captions = caption.generate_srt_captions()
             if not srt_captions:
                 message = "Caption track was found, but failed to generate SRT content."
@@ -103,7 +108,7 @@ def process_youtube_url(url: str):
                         video_id, segment['start'], segment['end'], segment['text'], sentiment
                     )
                     successful_segments += 1
-                elif segment_str.strip(): # Don't count empty lines as failures
+                elif segment_str.strip():
                     failed_segments += 1
             
             print(f"  > Summary: {successful_segments} segments parsed, {failed_segments} failed.")
@@ -115,22 +120,19 @@ def process_youtube_url(url: str):
                 db.update_queue_status(url, 'failed', message)
 
         except Exception as e:
-            message = f"An error occurred during video download or caption processing: {e}"
+            message = f"An error occurred during download or caption processing: {e}"
             print(f"  [ERROR] {message}")
             db.update_queue_status(url, 'failed', message)
 
     else:
-        # Path for when no English captions are found
+        # (This part for no captions found remains the same)
         message = "No English captions found. Downloading audio only for reference."
         print(f"  > {message}")
         try:
             audio_stream = yt.streams.get_audio_only()
             audio_path = audio_stream.download(output_path=str(DOWNLOAD_DIR))
-            # Correctly associate the downloaded audio file with the video record
             db.add_audio(video_id, audio_path)
             print(f"  > Audio downloaded to: {audio_path} and linked to video ID {video_id}.")
-            
-            # Mark as 'completed' but with a message indicating no captions were processed.
             db.update_queue_status(url, 'completed', message)
         except Exception as e:
             message = f"An error occurred during audio download: {e}"
@@ -145,10 +147,13 @@ def main():
     db.setup_database()
 
     while True:
-        url_to_process = db.get_next_queued_url_and_update()
-        if url_to_process:
+        # --- MODIFIED: Unpack the URL and the flag ---
+        job_data = db.get_next_queued_url_and_update()
+        if job_data:
+            url_to_process, skip_download_flag = job_data
             try:
-                process_youtube_url(url_to_process)
+                # --- MODIFIED: Pass the flag to the processing function ---
+                process_youtube_url(url_to_process, skip_download_flag)
             except PytubeFixError as e:
                 error_msg = f"PytubeFix error: {e}"
                 print(f"  [ERROR] Could not process video. {error_msg}")

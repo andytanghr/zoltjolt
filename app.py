@@ -60,13 +60,21 @@ def main():
         height=150
     )
 
+    # --- NEW: Add the checkbox ---
+    skip_download_checkbox = st.checkbox(
+        "Skip video download (caption analysis only)",
+        value=True,
+        help="If checked, the worker will only process captions and will not download the full video file. This saves disk space."
+    )
+
     if st.button("Add to Queue", key="add_button"):
         if url_input:
             urls = [url.strip() for url in url_input.split('\n') if url.strip()]
             if urls:
-                db.add_urls_to_queue(urls)
+                # --- MODIFIED: Pass the checkbox value to the database function ---
+                db.add_urls_to_queue(urls, skip_download=skip_download_checkbox)
                 st.success(f"Successfully added {len(urls)} URL(s) to the processing queue.")
-                time.sleep(1) # Small delay for better UX
+                time.sleep(1)
                 st.rerun()
             else:
                 st.warning("Please enter at least one valid URL.")

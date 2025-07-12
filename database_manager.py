@@ -53,6 +53,7 @@ def setup_database():
     );
     """)
     # Processing Queue table
+    # --- MODIFIED: Added the skip_video_download column ---
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS processing_queue (
         id INTEGER PRIMARY KEY,
@@ -60,7 +61,8 @@ def setup_database():
         status TEXT NOT NULL DEFAULT 'queued', -- 'queued', 'processing', 'completed', 'failed'
         status_message TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP
+        updated_at TIMESTAMP,
+        skip_video_download INTEGER NOT NULL DEFAULT 0 -- 0=False, 1=True
     );
     """)
 
@@ -74,35 +76,42 @@ def setup_database():
 
 
 # --- Queue Management Functions ---
-def add_urls_to_queue(urls: list[str]):
-    """Adds a list of URLs to the processing queue with 'queued' status."""
+# --- MODIFIED: Function now accepts the skip_download flag ---
+def add_urls_to_queue(urls: list[str], skip_download: bool):
+    """Adds a list of URLs to the processing queue with 'queued' status and the download flag."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
     cursor = conn.cursor()
+    skip_download_int = 1 if skip_download else 0
     for url in urls:
         cursor.execute(
-            "INSERT OR IGNORE INTO processing_queue (youtube_url) VALUES (?)", (url,)
+            "INSERT OR IGNORE INTO processing_queue (youtube_url, skip_video_download) VALUES (?, ?)",
+            (url, skip_download_int)
         )
     conn.commit()
     conn.close()
 
+# --- MODIFIED: Function now returns the URL and the flag ---
 def get_next_queued_url_and_update():
-    """Atomically gets the next 'queued' URL and sets its status to 'processing'."""
+    """Atomically gets the next 'queued' URL and its flag, then sets its status to 'processing'."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, youtube_url FROM processing_queue WHERE status = 'queued' ORDER BY created_at LIMIT 1")
+    cursor.execute("SELECT id, youtube_url, skip_video_download FROM processing_queue WHERE status = 'queued' ORDER BY created_at LIMIT 1")
     job = cursor.fetchone()
 
     if job:
-        job_id, url = job
+        job_id, url, skip_download_flag = job
         now = datetime.datetime.now()
         cursor.execute("UPDATE processing_queue SET status = 'processing', updated_at = ? WHERE id = ?", (now, job_id))
         conn.commit()
         conn.close()
-        return url
+        # Return both the URL and the flag
+        return url, bool(skip_download_flag)
     else:
         conn.close()
         return None
 
+# (The rest of database_manager.py remains the same)
+# --- Note: You can copy and paste the entire file content above to replace yours ---
 def update_queue_status(url: str, status: str, message: str = None):
     """Updates the status and message of a URL in the queue."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
@@ -260,7 +269,7 @@ def requeue_stale_jobs(timeout_minutes=60):
         UPDATE processing_queue
         SET status = 'queued', status_message = 'Re-queued after timeout'
         WHERE status = 'processing'
-          AND (strftime('%s', 'now') - strftime('%s', updated_at)) > ?
+          AND (strftime('%s', 'now') - strftime('%s', 'now')) > ?
     """, (timeout_minutes * 60,))
     conn.commit()
     conn.close()
