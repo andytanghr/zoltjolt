@@ -10,8 +10,11 @@ def format_seconds_to_srt(seconds: float) -> str:
     """Converts a float number of seconds to HH:MM:SS,ms format."""
     if seconds is None: return "00:00:00,000"
     millis = int((seconds - int(seconds)) * 1000)
-    td = pd.to_timedelta(seconds, unit='s')
-    return f"{str(td).split('.')[0]},{millis:03d}"
+    # Correctly handle potential floating point inaccuracies for display
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 def render_general_analysis(caption_df: pd.DataFrame):
     """Renders general and sectional sentiment analysis."""
@@ -60,7 +63,6 @@ def main():
         height=150
     )
 
-    # --- NEW: Add the checkbox ---
     skip_download_checkbox = st.checkbox(
         "Skip video download (caption analysis only)",
         value=True,
@@ -71,7 +73,6 @@ def main():
         if url_input:
             urls = [url.strip() for url in url_input.split('\n') if url.strip()]
             if urls:
-                # --- MODIFIED: Pass the checkbox value to the database function ---
                 db.add_urls_to_queue(urls, skip_download=skip_download_checkbox)
                 st.success(f"Successfully added {len(urls)} URL(s) to the processing queue.")
                 time.sleep(1)
@@ -86,7 +87,6 @@ def main():
     # --- UI TO DISPLAY RESULTS AND STATUS ---
     st.header("2. Processing Status & Results")
 
-    # Fetch all data once
     all_videos_data = db.get_all_videos_with_status()
     if not all_videos_data:
         st.info("No videos have been submitted yet. Use the tool above to start.")
@@ -94,7 +94,6 @@ def main():
 
     all_videos_df = pd.DataFrame([dict(row) for row in all_videos_data])
 
-    # Display the current queue
     st.subheader("Current Queue")
     queue_df = all_videos_df[all_videos_df['status'].isin(['queued', 'processing'])]
     if not queue_df.empty:
@@ -106,22 +105,34 @@ def main():
     else:
         st.info("The processing queue is currently empty.")
 
-    # Display selection for completed videos
     st.subheader("Explore Completed Videos")
     completed_df = all_videos_df[all_videos_df['status'] == 'completed'].copy()
 
     if not completed_df.empty:
-        completed_df['display_title'] = completed_df['title'].fillna('Title not available')
+        completed_df['display_title'] = completed_df.apply(
+            lambda row: row['title'] if pd.notna(row['title']) else row['youtube_url'],
+            axis=1
+        )
         selected_title = st.selectbox(
             "Select a video to see its detailed analysis:",
             options=completed_df['display_title']
         )
 
         if selected_title:
+            # --- MODIFIED: Added extensive logging ---
+            st.info(f"ACTION: User selected video titled '{selected_title}'.")
+            
             selected_video = completed_df[completed_df['display_title'] == selected_title].iloc[0]
             video_id = selected_video['video_id']
             
-            # --- NEW: DELETE BUTTON LOGIC ---
+            # Convert video_id to int, as it might be a float from pandas
+            if pd.notna(video_id):
+                video_id = int(video_id)
+                st.info(f"LOG: Found corresponding video_id: {video_id}.")
+            else:
+                st.error(f"FATAL: Could not find a valid 'video_id' for '{selected_title}'. Cannot fetch captions.")
+                return
+
             with st.expander("🗑️ Danger Zone: Delete This Video"):
                 st.warning(f"This will permanently delete the video '{selected_title}', its downloaded files, and all associated database records. This action cannot be undone.")
                 
@@ -143,22 +154,40 @@ def main():
                         st.error(f"An error occurred during deletion: {e}")
             
             st.markdown("---")
-            # --- END OF NEW LOGIC ---
 
+            st.info("LOG: Fetching captions from the database...")
             captions = db.get_captions_for_video(video_id)
 
             if captions:
+                st.success(f"LOG: Found {len(captions)} caption segments in the database.")
                 caption_df = pd.DataFrame([dict(row) for row in captions])
+                
+                # --- General Analysis ---
                 render_general_analysis(caption_df)
 
+                # --- NEW: Raw Data Inspector Section for Captions ---
+                with st.expander("Show Raw Caption Data for Selected Video"):
+                    st.info("This table shows the raw caption data retrieved from the database for the selected video.")
+                    st.dataframe(caption_df, use_container_width=True, hide_index=True)
+
+                # --- MODIFIED: Ensured Transcript Rendering is Robust ---
                 st.subheader("Timestamped Transcript")
                 with st.container(height=400):
-                    for _, row in caption_df.iterrows():
-                        start_time = format_seconds_to_srt(row['start_time'])
-                        color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
-                        st.markdown(f"**`{start_time}`** : {row['text']} [:{color}[{row['sentiment_label']}]]")
+                    # Check if dataframe is not empty again, as a safeguard
+                    if not caption_df.empty:
+                        for _, row in caption_df.iterrows():
+                            start_time = format_seconds_to_srt(row['start_time'])
+                            color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
+                            st.markdown(f"**`{start_time}`** → {row['text']} [:{color}[{row['sentiment_label']} ({row['sentiment_score']:.2f})]]")
+                    else:
+                        # This case should ideally not be reached if the parent `if captions:` is working
+                        st.warning("Could not display transcript. Caption data is empty.")
+
             else:
-                st.info("This video was processed, but no English captions were found. Only the audio file was saved.")
+                # --- MODIFIED: More informative logging/messaging ---
+                st.warning(f"LOG: No caption segments were found in the database for video_id {video_id}.")
+                st.info("This video was processed, but no English captions were found or saved. If the video has captions on YouTube, an error might have occurred during the ETL process. Check the worker's console output for details.")
+
     else:
         st.info("No videos have been successfully completed yet.")
 
