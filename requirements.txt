@@ -1,0 +1,17 @@
+# Web framework for the user interface
+streamlit==1.46.1
+
+# For data manipulation and display
+pandas==2.3.1
+
+# Core numerical library for pandas
+numpy==2.3.1
+
+# For downloading YouTube video streams and captions
+pytubefix==9.3.0
+
+# To simplify local deploy
+honcho==2.0.0
+
+# To allow hot-reloading during dev
+watchdog==6.0.0
