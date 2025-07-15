@@ -1,0 +1,706 @@
+```
+Content from: etl.py
+
+# content of: etl.py
+import time
+from pathlib import Path
+
+from pytubefix import YouTube
+from pytubefix.exceptions import PytubeFixError
+
+import database_manager as db
+
+# --- Configuration ---
+DOWNLOAD_DIR = Path(__file__).parent / "downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+WORKER_SLEEP_INTERVAL = 10 # Seconds to wait when queue is empty
+
+# --- Function Stubs ---
+# (analyze_sentiment and parse_srt_segment remain the same)
+def analyze_sentiment(text: str) -> dict:
+    """STUB: Analyzes the sentiment of a text string."""
+    if "happy" in text.lower() or "love" in text.lower():
+        return {"label": "POSITIVE", "score": 0.9}
+    if "sad" in text.lower() or "hate" in text.lower():
+        return {"label": "NEGATIVE", "score": -0.8}
+    return {"label": "NEUTRAL", "score": 0.1}
+
+def parse_srt_segment(segment: str):
+    """Parses a single SRT block into its components."""
+    lines = segment.strip().split('\n')
+    if len(lines) < 3:
+        return None
+
+    time_line = lines[1]
+    text_lines = lines[2:]
+
+    try:
+        start_str, end_str = [t.strip().replace(',', '.') for t in time_line.split('-->')]
+        def to_seconds(t_str):
+            parts = t_str.split(':')
+            h = int(parts[0])
+            m = int(parts[1])
+            s_parts = parts[2].split('.')
+            s = int(s_parts[0])
+            ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+            return h * 3600 + m * 60 + s + ms / 1000.0
+        return {
+            "start": to_seconds(start_str),
+            "end": to_seconds(end_str),
+            "text": " ".join(text_lines)
+        }
+    except (ValueError, IndexError) as e:
+        # LOGGING: More specific error on parsing failure
+        print(f"  [WARN] Could not parse timestamp line: '{time_line}'. Error: {e}")
+        return None
+
+# --- Core Logic Functions ---
+# --- MODIFIED: Function now accepts the skip_download flag ---
+def process_youtube_url(url: str, skip_download: bool):
+    """
+    Main processing function for a single YouTube URL with detailed logging.
+    This version uses a stable get-or-create pattern for video records.
+    """
+    print(f"\nProcessing URL: {url}")
+    yt = YouTube(url)
+    print(f"  > Title: {yt.title}")
+    
+    # --- MODIFIED: Log the download flag status ---
+    if skip_download:
+        print("  > Flag set to SKIP video download.")
+
+    video_id = db.get_or_create_video(url, yt.title, None)
+    print(f"  > Database Video ID: {video_id} (This is stable)")
+
+    all_caption_codes = [c.code for c in yt.captions]
+    print(f"  > Available caption codes: {all_caption_codes if all_caption_codes else 'None'}")
+
+    caption_en = yt.captions.get('en')
+    caption_a_en = yt.captions.get('a.en')
+    caption = caption_en or caption_a_en
+    
+    if caption:
+        print(f"  > Found English captions ('{caption.code}'). Proceeding with full processing...")
+        try:
+            # --- MODIFIED: Conditional video download ---
+            if not skip_download:
+                print("  > Downloading video file...")
+                video_stream = yt.streams.get_highest_resolution()
+                video_path = video_stream.download(output_path=str(DOWNLOAD_DIR))
+                db.update_video_path(video_id, video_path)
+                print(f"  > Video downloaded to: {video_path}")
+            else:
+                print("  > Skipping video download as requested.")
+
+            srt_captions = caption.generate_srt_captions()
+            if not srt_captions:
+                message = "Caption track was found, but failed to generate SRT content."
+                print(f"  [ERROR] {message}")
+                db.update_queue_status(url, 'failed', message)
+                return
+
+            print(f"  > Successfully generated SRT data ({len(srt_captions)} bytes).")
+            
+            srt_segments = srt_captions.strip().split('\n\n')
+            successful_segments, failed_segments = 0, 0
+            for segment_str in srt_segments:
+                segment = parse_srt_segment(segment_str)
+                if segment:
+                    sentiment = analyze_sentiment(segment['text'])
+                    db.add_caption_segment(
+                        video_id, segment['start'], segment['end'], segment['text'], sentiment
+                    )
+                    successful_segments += 1
+                elif segment_str.strip():
+                    failed_segments += 1
+            
+            print(f"  > Summary: {successful_segments} segments parsed, {failed_segments} failed.")
+            if successful_segments > 0:
+                message = f'Successfully processed with {successful_segments} caption segments.'
+                db.update_queue_status(url, 'completed', message)
+            else:
+                message = 'Processed, but failed to parse any caption segments.'
+                db.update_queue_status(url, 'failed', message)
+
+        except Exception as e:
+            message = f"An error occurred during download or caption processing: {e}"
+            print(f"  [ERROR] {message}")
+            db.update_queue_status(url, 'failed', message)
+
+    else:
+        # (This part for no captions found remains the same)
+        message = "No English captions found. Downloading audio only for reference."
+        print(f"  > {message}")
+        try:
+            audio_stream = yt.streams.get_audio_only()
+            audio_path = audio_stream.download(output_path=str(DOWNLOAD_DIR))
+            db.add_audio(video_id, audio_path)
+            print(f"  > Audio downloaded to: {audio_path} and linked to video ID {video_id}.")
+            db.update_queue_status(url, 'completed', message)
+        except Exception as e:
+            message = f"An error occurred during audio download: {e}"
+            print(f"  [ERROR] {message}")
+            db.update_queue_status(url, 'failed', message)
+
+# --- Script Entry Point ---
+def main():
+    """Main worker loop. Continuously checks for and processes jobs from the queue."""
+    print("--- YouTube ETL Worker Started ---")
+    print(f"Checking for new jobs every {WORKER_SLEEP_INTERVAL} seconds...")
+    db.setup_database()
+
+    while True:
+        # --- MODIFIED: Unpack the URL and the flag ---
+        job_data = db.get_next_queued_url_and_update()
+        if job_data:
+            url_to_process, skip_download_flag = job_data
+            try:
+                # --- MODIFIED: Pass the flag to the processing function ---
+                process_youtube_url(url_to_process, skip_download_flag)
+            except PytubeFixError as e:
+                error_msg = f"PytubeFix error: {e}"
+                print(f"  [ERROR] Could not process video. {error_msg}")
+                db.update_queue_status(url_to_process, 'failed', error_msg)
+            except Exception as e:
+                error_msg = f"An unexpected error occurred: {e}"
+                print(f"  [ERROR] {error_msg}")
+                db.update_queue_status(url_to_process, 'failed', error_msg)
+        else:
+            time.sleep(WORKER_SLEEP_INTERVAL)
+
+if __name__ == "__main__":
+    main()
+```
+
+```
+Content from: app.py
+
+# content of: app.py
+import streamlit as st
+import pandas as pd
+import database_manager as db
+import time
+from pathlib import Path
+import sqlite3
+
+def format_seconds_to_srt(seconds: float) -> str:
+    """Converts a float number of seconds to HH:MM:SS,ms format."""
+    if seconds is None: return "00:00:00,000"
+    millis = int((seconds - int(seconds)) * 1000)
+    # Correctly handle potential floating point inaccuracies for display
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+def render_general_analysis(caption_df: pd.DataFrame):
+    """Renders general and sectional sentiment analysis."""
+    st.subheader("Overall Sentiment Analysis")
+
+    if caption_df.empty:
+        st.warning("No caption data available for analysis.")
+        return
+
+    average_score = caption_df['sentiment_score'].mean()
+    positive_count = len(caption_df[caption_df['sentiment_label'] == 'POSITIVE'])
+    negative_count = len(caption_df[caption_df['sentiment_label'] == 'NEGATIVE'])
+    neutral_count = len(caption_df[caption_df['sentiment_label'] == 'NEUTRAL'])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Average Sentiment Score", f"{average_score:.2f}")
+
+    with col2:
+        sentiment_dist_df = pd.DataFrame({
+            'Sentiment': ['Positive', 'Neutral', 'Negative'],
+            'Count': [positive_count, neutral_count, negative_count]
+        }).set_index('Sentiment')
+        st.bar_chart(sentiment_dist_df)
+
+def main():
+    db.requeue_stale_jobs()
+    
+    """The main Streamlit application function."""
+    st.set_page_config(page_title="YouTube Content Analyzer", layout="wide")
+    st.title("🎬 YouTube Content Analyzer")
+    st.markdown("---")
+
+    # --- INSTRUCTIONS AND ETL MANAGEMENT ---
+    st.header("1. Add New Videos to the Queue")
+    st.info(
+        "**How to use:**\n"
+        "1. In a separate terminal, run the command: `python etl.py` to start the background worker.\n"
+        "2. Paste one or more YouTube URLs (one per line) into the text area below.\n"
+        "3. Click 'Add to Queue'. The worker will automatically pick them up."
+    )
+
+    url_input = st.text_area(
+        "YouTube URLs (one per line)",
+        placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...",
+        height=150
+    )
+
+    skip_download_checkbox = st.checkbox(
+        "Skip video download (caption analysis only)",
+        value=True,
+        help="If checked, the worker will only process captions and will not download the full video file. This saves disk space."
+    )
+
+    if st.button("Add to Queue", key="add_button"):
+        if url_input:
+            urls = [url.strip() for url in url_input.split('\n') if url.strip()]
+            if urls:
+                db.add_urls_to_queue(urls, skip_download=skip_download_checkbox)
+                st.success(f"Successfully added {len(urls)} URL(s) to the processing queue.")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.warning("Please enter at least one valid URL.")
+        else:
+            st.warning("The text area is empty.")
+
+    st.markdown("---")
+
+    # --- UI TO DISPLAY RESULTS AND STATUS ---
+    st.header("2. Processing Status & Results")
+
+    all_videos_data = db.get_all_videos_with_status()
+    if not all_videos_data:
+        st.info("No videos have been submitted yet. Use the tool above to start.")
+        return
+
+    all_videos_df = pd.DataFrame([dict(row) for row in all_videos_data])
+
+    st.subheader("Current Queue")
+    queue_df = all_videos_df[all_videos_df['status'].isin(['queued', 'processing'])]
+    if not queue_df.empty:
+        st.dataframe(
+            queue_df[['youtube_url', 'status']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("The processing queue is currently empty.")
+
+    st.subheader("Explore Completed Videos")
+    completed_df = all_videos_df[all_videos_df['status'] == 'completed'].copy()
+
+    if not completed_df.empty:
+        completed_df['display_title'] = completed_df.apply(
+            lambda row: row['title'] if pd.notna(row['title']) else row['youtube_url'],
+            axis=1
+        )
+        selected_title = st.selectbox(
+            "Select a video to see its detailed analysis:",
+            options=completed_df['display_title']
+        )
+
+        if selected_title:
+            # --- MODIFIED: Added extensive logging ---
+            # st.info(f"ACTION: User selected video titled '{selected_title}'.")
+            
+            selected_video = completed_df[completed_df['display_title'] == selected_title].iloc[0]
+            video_id = selected_video['video_id']
+            
+            # Convert video_id to int, as it might be a float from pandas
+            if pd.notna(video_id):
+                video_id = int(video_id)
+                # st.info(f"LOG: Found corresponding video_id: {video_id}.")
+            else:
+                st.error(f"FATAL: Could not find a valid 'video_id' for '{selected_title}'. Cannot fetch captions.")
+                return
+
+            with st.expander("🗑️ Danger Zone: Delete This Video"):
+                st.warning(f"This will permanently delete the video '{selected_title}', its downloaded files, and all associated database records. This action cannot be undone.")
+                
+                if st.button("Confirm Permanent Deletion", key=f"delete_{video_id}"):
+                    try:
+                        paths_to_delete = db.delete_video_and_references(video_id)
+                        
+                        deleted_files_count = 0
+                        for file_path in paths_to_delete:
+                            if file_path and file_path.exists():
+                                file_path.unlink()
+                                deleted_files_count += 1
+                        
+                        st.success(f"Successfully deleted '{selected_title}' and {deleted_files_count} associated file(s). Refreshing...")
+                        time.sleep(2)
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"An error occurred during deletion: {e}")
+            
+            st.markdown("---")
+
+            # st.info("LOG: Fetching captions from the database...")
+            captions = db.get_captions_for_video(video_id)
+
+            if captions:
+                # st.success(f"LOG: Found {len(captions)} caption segments in the database.")
+                caption_df = pd.DataFrame([dict(row) for row in captions])
+                
+                # --- General Analysis ---
+                render_general_analysis(caption_df)
+
+                # --- NEW: Raw Data Inspector Section for Captions ---
+                with st.expander("Show Raw Caption Data for Selected Video"):
+                    st.info("This table shows the raw caption data retrieved from the database for the selected video.")
+                    st.dataframe(caption_df, use_container_width=True, hide_index=True)
+
+                # --- MODIFIED: Ensured Transcript Rendering is Robust ---
+                st.subheader("Timestamped Transcript")
+                with st.container(height=400):
+                    # Check if dataframe is not empty again, as a safeguard
+                    if not caption_df.empty:
+                        for _, row in caption_df.iterrows():
+                            start_time = format_seconds_to_srt(row['start_time'])
+                            color = "green" if row['sentiment_label'] == "POSITIVE" else "red" if row['sentiment_label'] == "NEGATIVE" else "gray"
+                            st.markdown(f"**`{start_time}`** → {row['text']} [:{color}[{row['sentiment_label']} ({row['sentiment_score']:.2f})]]")
+                    else:
+                        # This case should ideally not be reached if the parent `if captions:` is working
+                        st.warning("Could not display transcript. Caption data is empty.")
+
+            else:
+                # --- MODIFIED: More informative logging/messaging ---
+                st.warning(f"LOG: No caption segments were found in the database for video_id {video_id}.")
+                st.info("This video was processed, but no English captions were found or saved. If the video has captions on YouTube, an error might have occurred during the ETL process. Check the worker's console output for details.")
+
+    else:
+        st.info("No videos have been successfully completed yet.")
+
+
+    with st.expander("Show All Submitted Videos & Full Status History"):
+        st.dataframe(
+            all_videos_df[['youtube_url', 'status', 'title', 'status_message', 'updated_at']],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "youtube_url": st.column_config.LinkColumn("YouTube URL", display_text="🔗 Link"),
+                "updated_at": st.column_config.DatetimeColumn("Last Updated", format="YYYY-MM-DD HH:mm:ss")
+            }
+        )
+
+    st.markdown("---")
+    with st.expander("🗃️ Database Inspector (Advanced View)"):
+        st.info("This section shows the raw data from the project's database tables.")
+        table_names = ["processing_queue", "videos", "captions", "audios"]
+        for table in table_names:
+            st.subheader(f"Table: `{table}`")
+            try:
+                table_data = db.get_all_from_table(table)
+                if table_data:
+                    df = pd.DataFrame([dict(row) for row in table_data])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.write("This table is currently empty.")
+            except sqlite3.OperationalError as e:
+                st.error(f"Could not read table '{table}'. It might not exist yet. Error: {e}")
+            st.markdown("---")
+
+if __name__ == "__main__":
+    db.setup_database()
+    main()
+```
+
+```
+Content from: database_manager.py
+
+# content of: database_manager.py
+import sqlite3
+from pathlib import Path
+import datetime
+
+# --- Configuration ---
+DB_FILE = Path(__file__).parent / "project.db"
+DB_TIMEOUT = 15 # seconds
+
+# --- Database Setup ---
+def setup_database():
+    """
+    Creates the necessary database tables if they don't already exist.
+    This function is idempotent (safe to run multiple times).
+    """
+    db_existed = DB_FILE.exists()
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+
+    # Enable foreign key support
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    # Videos table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS videos (
+        id INTEGER PRIMARY KEY,
+        youtube_url TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        download_path TEXT,
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    # Audios table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audios (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL,
+        audio_path TEXT NOT NULL,
+        FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
+    );
+    """)
+    # Captions table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS captions (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL,
+        start_time REAL NOT NULL,
+        end_time REAL NOT NULL,
+        text TEXT NOT NULL,
+        sentiment_label TEXT,
+        sentiment_score REAL,
+        FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
+    );
+    """)
+    # Processing Queue table
+    # --- MODIFIED: Added the skip_video_download column ---
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processing_queue (
+        id INTEGER PRIMARY KEY,
+        youtube_url TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'queued', -- 'queued', 'processing', 'completed', 'failed'
+        status_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        skip_video_download INTEGER NOT NULL DEFAULT 0 -- 0=False, 1=True
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+
+    if db_existed:
+        print("Existing database found. Ensured all tables are present.")
+    else:
+        print("No database found. Created new database 'project.db' and initialized schema.")
+
+
+# --- Queue Management Functions ---
+# --- MODIFIED: Function now accepts the skip_download flag ---
+def add_urls_to_queue(urls: list[str], skip_download: bool):
+    """Adds a list of URLs to the processing queue with 'queued' status and the download flag."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    skip_download_int = 1 if skip_download else 0
+    for url in urls:
+        cursor.execute(
+            "INSERT OR IGNORE INTO processing_queue (youtube_url, skip_video_download) VALUES (?, ?)",
+            (url, skip_download_int)
+        )
+    conn.commit()
+    conn.close()
+
+# --- MODIFIED: Function now returns the URL and the flag ---
+def get_next_queued_url_and_update():
+    """Atomically gets the next 'queued' URL and its flag, then sets its status to 'processing'."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, youtube_url, skip_video_download FROM processing_queue WHERE status = 'queued' ORDER BY created_at LIMIT 1")
+    job = cursor.fetchone()
+
+    if job:
+        job_id, url, skip_download_flag = job
+        now = datetime.datetime.now()
+        cursor.execute("UPDATE processing_queue SET status = 'processing', updated_at = ? WHERE id = ?", (now, job_id))
+        conn.commit()
+        conn.close()
+        # Return both the URL and the flag
+        return url, bool(skip_download_flag)
+    else:
+        conn.close()
+        return None
+
+# (The rest of database_manager.py remains the same)
+# --- Note: You can copy and paste the entire file content above to replace yours ---
+def update_queue_status(url: str, status: str, message: str = None):
+    """Updates the status and message of a URL in the queue."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    now = datetime.datetime.now()
+    cursor.execute(
+        "UPDATE processing_queue SET status = ?, status_message = ?, updated_at = ? WHERE youtube_url = ?",
+        (status, message, now, url)
+    )
+    conn.commit()
+    conn.close()
+
+# --- Write Functions (for etl.py) ---
+def get_or_create_video(url, title, download_path):
+    """
+    Gets the ID of an existing video or creates a new one if not found.
+    Returns the stable video ID. This is non-destructive.
+    """
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    # Check if the video already exists
+    cursor.execute("SELECT id FROM videos WHERE youtube_url = ?", (url,))
+    video_row = cursor.fetchone()
+
+    if video_row:
+        video_id = video_row[0]
+    else:
+        # Insert a new video record and get its ID
+        cursor.execute("INSERT INTO videos (youtube_url, title, download_path) VALUES (?, ?, ?)",
+                       (url, title, download_path)) 
+        video_id = cursor.lastrowid
+    
+    conn.commit()
+    conn.close()
+    return video_id
+
+def update_video_path(video_id, download_path):
+    """Updates the download_path for a given video."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE videos SET download_path = ? WHERE id = ?", (download_path, video_id))
+    conn.commit()
+    conn.close()
+
+def add_audio(video_id, audio_path):
+    """Adds an audio record."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO audios (video_id, audio_path) VALUES (?, ?)",
+                   (video_id, audio_path))
+    conn.commit()
+    conn.close()
+
+def add_caption_segment(video_id, start, end, text, sentiment):
+    """Adds a single caption segment with its sentiment."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO captions (video_id, start_time, end_time, text, sentiment_label, sentiment_score)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (video_id, start, end, text, sentiment['label'], sentiment['score']))
+    conn.commit()
+    conn.close()
+
+# --- NEW: Deletion Function ---
+def delete_video_and_references(video_id: int):
+    """
+    Deletes a video and all its associated data from the database,
+    and returns the local file paths of the video/audio for filesystem deletion.
+    """
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    paths_to_delete = []
+
+    # Step 1: Gather file paths and youtube_url before deleting
+    cursor.execute("SELECT download_path, youtube_url FROM videos WHERE id = ?", (video_id,))
+    video_info = cursor.fetchone()
+    if not video_info:
+        conn.close()
+        return []
+
+    video_path, youtube_url = video_info
+    if video_path:
+        paths_to_delete.append(Path(video_path))
+
+    cursor.execute("SELECT audio_path FROM audios WHERE video_id = ?", (video_id,))
+    audio_rows = cursor.fetchall()
+    for row in audio_rows:
+        if row[0]:
+            paths_to_delete.append(Path(row[0]))
+
+    # Step 2: Delete database records
+    # With "ON DELETE CASCADE" enabled, we only need to delete the video record.
+    # The related captions and audios will be deleted automatically.
+    cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+    
+    # Also remove it from the queue
+    if youtube_url:
+        cursor.execute("DELETE FROM processing_queue WHERE youtube_url = ?", (youtube_url,))
+
+    conn.commit()
+    conn.close()
+    
+    return paths_to_delete
+
+# --- Raw Table Read Functions (for app.py inspector) ---
+def get_all_from_table(table_name: str):
+    """A generic function to fetch all rows from a given table."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    results = cursor.execute(f"SELECT * FROM {table_name} ORDER BY id DESC;").fetchall()
+    conn.close()
+    return results
+
+# --- Read Functions (for app.py) ---
+def get_all_videos_with_status():
+    """
+    Returns a list of all submitted videos and their current status.
+    """
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    query = """
+    SELECT
+        q.youtube_url,
+        q.status,
+        q.status_message,
+        q.updated_at,
+        v.id as video_id,
+        v.title
+    FROM processing_queue q
+    LEFT JOIN videos v ON q.youtube_url = v.youtube_url
+    ORDER BY q.created_at DESC;
+    """
+    results = cursor.execute(query).fetchall()
+    conn.close()
+    return results
+
+def get_captions_for_video(video_id):
+    """Returns all caption segments for a given video ID."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=DB_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    captions = cursor.execute("SELECT start_time, end_time, text, sentiment_label, sentiment_score FROM captions WHERE video_id = ? ORDER BY start_time ASC;", (video_id,)).fetchall()
+    conn.close()
+    return captions
+
+def requeue_stale_jobs(timeout_minutes=60):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE processing_queue
+        SET status = 'queued', status_message = 'Re-queued after timeout'
+        WHERE status = 'processing'
+          AND (strftime('%s', 'now') - strftime('%s', 'now')) > ?
+    """, (timeout_minutes * 60,))
+    conn.commit()
+    conn.close()
+```
+
+```
+Content from: requirements.txt
+
+# Web framework for the user interface
+streamlit==1.46.1
+
+# For data manipulation and display
+pandas==2.3.1
+
+# Core numerical library for pandas
+numpy==2.3.1
+
+# For downloading YouTube video streams and captions
+pytubefix==9.3.0
+
+# To simplify local deploy
+honcho==2.0.0
+
+# To allow hot-reloading during dev
+watchdog==6.0.0
+```
+
