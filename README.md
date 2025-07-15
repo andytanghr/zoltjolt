@@ -119,3 +119,10 @@ Open your web browser and navigate to the local URL provided by Streamlit in the
 ## ⏹️ Stopping the Application
 
 To stop both the web server and the worker, return to the terminal where `honcho` is running and press `Ctrl+C`.
+
+## Screenshots
+
+![screenshot1](https://github.com/andytanghr/zoltjolt/blob/main/assets/Screenshot%202025-07-15%20at%208.15.44%E2%80%AFAM.png?raw=true)
+![screenshot2](https://github.com/andytanghr/zoltjolt/blob/main/assets/Screenshot%202025-07-15%20at%208.15.55%E2%80%AFAM.png?raw=true)
+![screenshot3](https://github.com/andytanghr/zoltjolt/blob/main/assets/Screenshot%202025-07-15%20at%208.16.06%E2%80%AFAM.png?raw=true)
+![screenshot4](https://github.com/andytanghr/zoltjolt/blob/main/assets/Screenshot%202025-07-15%20at%208.15.44%E2%80%AFAM.png?raw=true)
